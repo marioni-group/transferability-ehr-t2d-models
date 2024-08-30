@@ -1,0 +1,152 @@
+```{r}
+generate_k_fold_indexes <- FALSE
+if (generate_k_fold_indexes) {
+  source("../src/functions/model_fitting_functions.R")
+  # To be run once to generate topic model fold indexes
+  condition_preprocessing_result <- readRDS("../data/r11_condition/20231113/condition_preprocessing_result.rds")
+  t2d_endpoint <- condition_preprocessing_result$t2d_endpoint
+  
+  nrow_prediction_model_set <- nrow_prediction_model_set <- t2d_endpoint %>% filter(prediction_model_set_index == 1) %>% nrow
+  
+  topic_model_set_k_fold_cv_indexes <- get_k_fold_cv_indexes(df = t2d_endpoint %>% filter(prediction_model_set_index == 0),
+                                                             k = 3)
+  # Prediction model set rows are all at the top of t2d_endpoint so fill in those with NAs first
+  topic_model_set_k_fold_cv_indexes <- c(rep(NA, nrow_prediction_model_set), topic_model_set_k_fold_cv_indexes)
+  t2d_endpoint$topic_model_set_k_fold_cv_indexes <- topic_model_set_k_fold_cv_indexes
+  
+  saveRDS(t2d_endpoint, "../data/r11_condition/20231113/t2d_endpoint_with_topic_model_cv_indexes.rds")
+}
+```
+
+Configure parameters
+```{r}
+# sample_size <- 10000
+number_of_topics <- c(40, 80, 120, 160, 200)
+plot_topics <- FALSE
+data_path <- "../data/r11_condition/20231113/"
+results_folder_path <- "../models/r11_condition/20231124/topic_models/"
+fold_number <- 5
+```
+
+```{r}
+library(topicmodels)
+library(dplyr)
+library(readr)
+library(tidytext)
+library(ggplot2)
+source("../src/functions/util_functions.R")
+```
+
+```{r}
+set.seed(42)
+condition_preprocessing_result <- readRDS("../data/r11_condition/20231113/condition_preprocessing_result.rds")
+condition_frequency_wide <- condition_preprocessing_result$condition_frequency_wide
+t2d_endpoint <- readRDS("../data/r11_condition/20231113/t2d_endpoint_with_topic_model_cv_indexes.rds")
+condition_preprocessing_result <- NULL
+gc()
+```
+
+```{r}
+# Filter condition frequency table to topic modelling set and training folds
+condition_frequency_wide <- condition_frequency_wide[t2d_endpoint$prediction_model_set_index == 0, ]
+
+t2d_endpoint <- t2d_endpoint %>% filter(prediction_model_set_index == 0)
+
+model_fitting_set <- condition_frequency_wide[!(t2d_endpoint$topic_model_set_k_fold_cv_indexes == fold_number), ]
+perplexity_set <- condition_frequency_wide[t2d_endpoint$topic_model_set_k_fold_cv_indexes == fold_number, ]
+
+condition_frequency_wide <- NULL
+gc()
+
+condition_presence_counts <- ((model_fitting_set %>% select(-person_id)) > 0) %>% apply(2, sum)
+condition_presence_1k <- condition_presence_counts[condition_presence_counts >= 100] %>% names
+
+person_id_table_mfs <- model_fitting_set %>% select(person_id)
+person_id_table_ps <- perplexity_set %>% select(person_id)
+
+model_fitting_set <- model_fitting_set[, colnames(model_fitting_set) %in% condition_presence_1k]
+perplexity_set <- perplexity_set[, colnames(perplexity_set) %in% condition_presence_1k]
+
+gc()
+
+non_zero_index_mfs <- model_fitting_set %>% apply(1, function(x) {any(x > 0)})
+
+model_fitting_set <- model_fitting_set[non_zero_index_mfs, ]
+person_id_table_mfs <- person_id_table_mfs[non_zero_index_mfs, , drop = FALSE]
+
+non_zero_index_ps <- perplexity_set %>% apply(1, function(x) {any(x > 0)})
+
+perplexity_set <- perplexity_set[non_zero_index_ps, ]
+person_id_table_ps <- person_id_table_ps[non_zero_index_ps, , drop = FALSE]
+
+gc()
+
+
+topic_models <- lapply(number_of_topics, function(n_topics) {
+  print(paste0("Number of topics: ", n_topics))
+  print(system.time({tm <- LDA(model_fitting_set, k = n_topics, control = list(seed = 42))}))
+  tm
+})
+```
+
+```{r}
+perplexities <- sapply(topic_models, function(tm) {
+  perplexity(tm, newdata = perplexity_set %>% as.matrix)
+})
+
+perplexity_plot_df <- data.frame(n_topics = number_of_topics, Perplexity = perplexities)
+
+perplexity_plot <- perplexity_plot_df %>% ggplot(aes(x = n_topics, y = Perplexity)) + geom_line() + theme_minimal(base_size = 16)
+perplexity_plot
+```
+
+TODO: update code below
+```{r}
+process_topic_model <- function(topic_model, n_top_terms = 5) {
+  
+  condition_topics <- tidy(topic_model, matrix = "beta")
+
+  condition_topics_max_beta <- condition_topics %>% group_by(term) %>% filter(beta == max(beta)) %>% add_count(name = "term_topic_count") %>% ungroup()
+  
+  # Some terms have the same probability for all topics and therefore all their max values are the same
+  # Filter condition_topics_max_beta to only terms that have a unique max
+  condition_topics_unique <- condition_topics_max_beta %>% filter(term_topic_count == 1)
+  
+  ap_top_terms <- condition_topics %>%
+    group_by(topic) %>%
+    slice_max(beta, n = n_top_terms) %>% 
+    ungroup() %>%
+    arrange(topic, -beta)
+  list(condition_topics = condition_topics, 
+       condition_topics_max_beta = condition_topics_max_beta,
+       condition_topics_unique = condition_topics_unique,
+       ap_top_terms = ap_top_terms)
+}
+
+# Post-processing of topic model with the smallest perplexity
+min_ppxt_index <- which.min(perplexity_plot_df$Perplexity)
+min_ppxt_n_topics <- number_of_topics[[min_ppxt_index]]
+min_ppxt_tm <- topic_models[[min_ppxt_index]]
+
+min_ppxt_post_processing_result <- process_topic_model(min_ppxt_tm)
+```
+
+Plot topics
+```{r}
+plot_topic_top_terms <- function(post_processing_result, n_topics, save_folder_path = results_folder_path) {
+  for (t in 1:n_topics) {
+    p <- post_processing_result$ap_top_terms %>%
+      filter(topic == t) %>%
+      mutate(term = reorder_within(term, beta, topic)) %>%
+      ggplot(aes(beta, term)) +
+      geom_col(show.legend = FALSE) +
+      ggtitle(paste0("Topic ", t)) +
+      scale_y_reordered()
+    print(p)
+  }
+}
+
+plot_topic_top_terms(min_ppxt_post_processing_result, n_topics = min_ppxt_n_topics)
+
+
+```
